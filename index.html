@@ -1,0 +1,94 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Audio Noise Reducer (E4) — SVD</title><link rel="icon" href="data:,">
+<style>
+:root{--bg:#f6f7fb;--card:#fff;--tx:#1f2430;--mu:#6b7280;--ac:#4f46e5;--bd:#e5e7eb;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#12141b;--card:#1b1e28;--tx:#e8eaf0;--mu:#9aa1b2;--bd:#2c3040}}
+:root[data-theme=dark]{--bg:#12141b;--card:#1b1e28;--tx:#e8eaf0;--mu:#9aa1b2;--bd:#2c3040}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:1000px;margin:auto;padding:20px}
+h1{font-size:1.5rem;margin:0}p.sub{color:var(--mu);margin:.2rem 0 1rem}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+label{display:block;font-weight:600;margin-top:8px}input[type=range]{width:100%}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.stat{background:var(--bg);border-radius:10px;padding:10px}.stat b{display:block;font-size:1.3rem;color:var(--ac)}.stat span{color:var(--mu);font-size:.8rem}
+button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;margin:6px 6px 0 0}
+canvas{width:100%;height:200px;display:block;border-radius:8px}
+h3{margin:0 0 6px;font-size:1rem}.note{color:var(--mu);font-size:.85rem}
+</style></head><body><main>
+<h1>🎧 Audio Noise Reducer (E4)</h1>
+<p class="sub">STFT → magnitude matrix A (time × freq) → SVD → keep top-k singular values → reconstruct. Runs fully in your browser.</p>
+<div class="card grid">
+ <div><label>Input SNR: <span id="snrv">0</span> dB</label><input id="snr" type="range" min="-10" max="15" value="0"></div>
+ <div><label>Rank k kept: <span id="kv">3</span></label><input id="k" type="range" min="1" max="20" value="3"></div>
+ <div><button id="pn">▶ Noisy</button><button id="pd">▶ Denoised</button><button id="pc">▶ Clean</button><button id="rs">↻ New noise</button></div>
+</div>
+<div class="card"><div class="stats" id="stats"></div></div>
+<div class="grid">
+ <div class="card"><h3>Singular values σᵢ</h3><canvas id="c1"></canvas><div class="note">Large = signal, flat tail = noise floor. Red = kept.</div></div>
+ <div class="card"><h3>Waveform (first 50 ms)</h3><canvas id="c2"></canvas><div class="note">Gray noisy · blue clean · red denoised</div></div>
+ <div class="card"><h3>Noisy spectrogram</h3><canvas id="c3"></canvas></div>
+ <div class="card"><h3>Denoised spectrogram</h3><canvas id="c4"></canvas></div>
+</div>
+<div class="card note"><b>Assumptions:</b> SVD on magnitude |X|; noisy phase reused; additive white Gaussian noise; Hann window, 75% overlap. Singular triplets via power iteration with deflation (top 20).</div>
+</main>
+<script>
+const FS=8000,DUR=2,N=256,HOP=64,KMAX=20;
+let seed=42,clean,noisy,den,sv,cache;
+// seeded RNG + Gaussian (Box–Muller)
+function rng(s){return()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function gauss(r){return Math.sqrt(-2*Math.log(r()+1e-12))*Math.cos(2*Math.PI*r())}
+// benchmark: gated tones (speech-like) + noise with SNR = 10log10(Ps/Pn)
+function makeClean(){const L=FS*DUR,x=new Float64Array(L),g=(f,p,t)=>Math.max(0,Math.sin(2*Math.PI*f*t+p));
+ for(let i=0;i<L;i++){const t=i/FS,s=Math.PI*2*t;x[i]=Math.sin(s*220)*g(1.5,0,t)+.6*Math.sin(s*440)*g(1.5,0,t)+.5*Math.sin(s*1100)*g(1,1,t)+.3*Math.sin(s*2200)*g(1,1,t)}return x}
+const pw=x=>x.reduce((a,b)=>a+b*b,0)/x.length;
+const snrDb=(r,e)=>{let a=0,b=0;for(let i=0;i<r.length;i++){a+=r[i]**2;b+=(r[i]-e[i])**2}return 10*Math.log10(a/b)};
+// radix-2 FFT (in place)
+function fft(re,im,inv){const n=re.length;for(let i=1,j=0;i<n;i++){let b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]]}}
+ for(let l=2;l<=n;l<<=1){const a=(inv?2:-2)*Math.PI/l,wr=Math.cos(a),wi=Math.sin(a);for(let i=0;i<n;i+=l){let cr=1,ci=0;for(let j=0;j<l/2;j++){const u=i+j,v=u+l/2,tr=re[v]*cr-im[v]*ci,ti=re[v]*ci+im[v]*cr;re[v]=re[u]-tr;im[v]=im[u]-ti;re[u]+=tr;im[u]+=ti;const t=cr*wr-ci*wi;ci=cr*wi+ci*wr;cr=t}}}}
+const WIN=Float64Array.from({length:N},(_,i)=>.5-.5*Math.cos(2*Math.PI*i/N)),F=N/2+1;
+function stft(x){const p=N/2,T=1+Math.floor((x.length+2*p-N)/HOP),A=[],Ph=[];
+ for(let t=0;t<T;t++){const re=new Float64Array(N),im=new Float64Array(N);for(let i=0;i<N;i++){const k=t*HOP+i-p;re[i]=(k>=0&&k<x.length?x[k]:0)*WIN[i]}fft(re,im);
+  A.push(Float64Array.from({length:F},(_,f)=>Math.hypot(re[f],im[f])));Ph.push(Float64Array.from({length:F},(_,f)=>Math.atan2(im[f],re[f])))}return{A,Ph,T}}
+function istft(A,Ph,L){const p=N/2,out=new Float64Array(L),nm=new Float64Array(L);
+ for(let t=0;t<A.length;t++){const re=new Float64Array(N),im=new Float64Array(N);
+  for(let f=0;f<F;f++){re[f]=A[t][f]*Math.cos(Ph[t][f]);im[f]=A[t][f]*Math.sin(Ph[t][f]);if(f>0&&f<N/2){re[N-f]=re[f];im[N-f]=-im[f]}}
+  fft(re,im,true);for(let i=0;i<N;i++){const k=t*HOP+i-p;if(k>=0&&k<L){out[k]+=re[i]/N*WIN[i];nm[k]+=WIN[i]**2}}}
+ for(let i=0;i<L;i++)out[i]/=Math.max(nm[i],1e-8);return out}
+// top-KMAX singular triplets: power iteration on AᵀA with deflation
+function svdTop(A,K){const T=A.length,R=A.map(r=>Float64Array.from(r)),out=[],r=rng(7);
+ for(let q=0;q<K;q++){let v=Float64Array.from({length:F},()=>r()-.5),s=0,u=new Float64Array(T);
+  for(let it=0;it<80;it++){for(let t=0;t<T;t++){let a=0;for(let f=0;f<F;f++)a+=R[t][f]*v[f];u[t]=a}
+   const w=new Float64Array(F);for(let t=0;t<T;t++)for(let f=0;f<F;f++)w[f]+=R[t][f]*u[t];
+   const n=Math.hypot(...w);for(let f=0;f<F;f++)v[f]=w[f]/n}
+  for(let t=0;t<T;t++){let a=0;for(let f=0;f<F;f++)a+=R[t][f]*v[f];u[t]=a}
+  s=Math.hypot(...u);u=u.map(a=>a/s);out.push({s,u:Float64Array.from(u),v:Float64Array.from(v)});
+  for(let t=0;t<T;t++)for(let f=0;f<F;f++)R[t][f]-=s*u[t]*v[f]}return out}
+function recompute(newNoise){const db=+snr.value,k=+kk.value;
+ if(newNoise)seed=Math.floor(Math.random()*1e6);
+ clean=makeClean();const r=rng(seed),sg=Math.sqrt(pw(clean)/10**(db/10));noisy=clean.map(x=>x+sg*gauss(r));
+ cache=stft(noisy);sv=svdTop(cache.A,KMAX);draw(k)}
+function draw(k){const{A,Ph,T}=cache,Ak=A.map(()=>new Float64Array(F));
+ for(let q=0;q<k;q++){const{s,u,v}=sv[q];for(let t=0;t<T;t++)for(let f=0;f<F;f++)Ak[t][f]+=s*u[t]*v[f]}
+ for(const r of Ak)for(let f=0;f<F;f++)r[f]=Math.max(0,r[f]);   // magnitudes ≥ 0
+ den=istft(Ak,Ph,noisy.length);
+ const tot=A.reduce((a,r)=>a+r.reduce((b,x)=>b+x*x,0),0),kept=sv.slice(0,k).reduce((a,o)=>a+o.s**2,0);
+ const s0=snrDb(clean,noisy),s1=snrDb(clean,den);
+ stats.innerHTML=`<div class="stat"><b>${A.length}×${F}</b><span>Matrix T×F</span></div><div class="stat"><b>${k}</b><span>Rank kept</span></div><div class="stat"><b>${(kept/tot*100).toFixed(1)}%</b><span>Energy kept</span></div><div class="stat"><b>${s0.toFixed(2)} dB</b><span>SNR noisy</span></div><div class="stat"><b>${s1.toFixed(2)} dB</b><span>SNR denoised</span></div><div class="stat"><b>${(s1-s0>=0?'+':'')+(s1-s0).toFixed(2)} dB</b><span>Improvement</span></div>`;
+ bars();wave();spec(c3,A);spec(c4,Ak)}
+const $=id=>document.getElementById(id),snr=$('snr'),kk=$('k'),stats=$('stats'),c1=$('c1'),c2=$('c2'),c3=$('c3'),c4=$('c4');
+function ctx(c){const d=devicePixelRatio||1;c.width=c.clientWidth*d;c.height=c.clientHeight*d;const g=c.getContext('2d');g.setTransform(d,0,0,d,0,0);g.clearRect(0,0,c.clientWidth,c.clientHeight);return g}
+function bars(){const g=ctx(c1),W=c1.clientWidth,H=c1.clientHeight,m=sv[0].s,k=+kk.value,w=W/KMAX;
+ sv.forEach((o,i)=>{const h=o.s/m*(H-20);g.fillStyle=i<k?'#dc2626':'#94a3b8';g.fillRect(i*w+2,H-h,w-4,h)})}
+function wave(){const g=ctx(c2),W=c2.clientWidth,H=c2.clientHeight,n=FS*.05|0;
+ [[noisy,'#c7ccd6'],[clean,'#2563eb'],[den,'#dc2626']].forEach(([x,c])=>{g.strokeStyle=c;g.beginPath();for(let i=0;i<n;i++){const X=i/n*W,Y=H/2-x[i]/3*H/2;i?g.lineTo(X,Y):g.moveTo(X,Y)}g.stroke()})}
+function spec(c,A){const g=ctx(c),W=c.clientWidth,H=c.clientHeight,T=A.length,mx=Math.max(...cache.A.map(r=>Math.max(...r)));
+ const cw=W/T,ch=H/(F/2);for(let t=0;t<T;t++)for(let f=0;f<F/2;f++){const db=20*Math.log10(A[t][f]/mx+1e-6),v=Math.min(1,Math.max(0,(db+60)/60));
+  g.fillStyle=`hsl(${260-v*220},80%,${10+v*55}%)`;g.fillRect(t*cw,H-(f+1)*ch,cw+1,ch+1)}}
+let ac;function play(x){ac=ac||new AudioContext();const m=Math.max(...x.map(Math.abs)),b=ac.createBuffer(1,x.length,FS);b.copyToChannel(Float32Array.from(x,v=>v/m*.8),0);const s=ac.createBufferSource();s.buffer=b;s.connect(ac.destination);s.start()}
+snr.oninput=()=>{$('snrv').textContent=snr.value;recompute(false)};kk.oninput=()=>{$('kv').textContent=kk.value;draw(+kk.value)};
+$('pn').onclick=()=>play(noisy);$('pd').onclick=()=>play(den);$('pc').onclick=()=>play(clean);$('rs').onclick=()=>recompute(true);
+addEventListener('resize',()=>draw(+kk.value));recompute(false);
+</script></body></html>
